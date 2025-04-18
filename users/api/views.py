@@ -4,16 +4,24 @@ from rest_framework import status
 from django_redis import get_redis_connection
 from rest_framework_simplejwt.tokens import RefreshToken
 
+from users.throttles import OTPAttemptThrottle, LoginAttemptThrottle
 from users.utils import generate_otp
+from rest_framework.permissions import IsAuthenticated
+from rest_framework_simplejwt.authentication import JWTAuthentication
+
 from users.api.serializers import (
     PhoneNumberSerializer,
     OTPVerificationSerializer,
+    LoginWithPasswordSerializer,
+    ProfileSerializer,
 )
 from users.models import CustomUser
+from django_kavenegar.common import send_otp
 
 
 class LoginRequestView(generics.GenericAPIView):
     serializer_class = PhoneNumberSerializer
+    throttle_classes = [LoginAttemptThrottle]
 
     def post(self, request):
         serializer = self.serializer_class(data=request.data)
@@ -24,18 +32,21 @@ class LoginRequestView(generics.GenericAPIView):
         if not user:
             response_data["is_new_user"] = True
             response_data["otp_sent"] = True
+            otp = generate_otp()
+            send_otp(phone_number, otp)
+            print(otp)
+            redis_connection = get_redis_connection("default")
+            redis_connection.setex(f"otp_{phone_number}", 60 * 5, otp)
         else:
             response_data["is_new_user"] = False
             response_data["otp_sent"] = False
 
-        otp = generate_otp()
-        redis_connection = get_redis_connection("default")
-        redis_connection.setex(f"otp_{phone_number}", 60 * 5, otp)
         return Response(response_data, status=status.HTTP_200_OK)
 
 
 class OTPVerificationView(generics.GenericAPIView):
     serializer_class = OTPVerificationSerializer
+    throttle_classes = [OTPAttemptThrottle]
 
     def post(self, request):
         serializer = self.serializer_class(data=request.data)
@@ -45,11 +56,14 @@ class OTPVerificationView(generics.GenericAPIView):
         redis_connection = get_redis_connection("default")
         stored_otp = redis_connection.get(f"otp_{phone_number}")
         if not stored_otp:
+
             return Response(
                 {"error": "کد تایید منقضی شده یا وجود ندارد"},
                 status=status.HTTP_400_BAD_REQUEST,
             )
+
         if stored_otp.decode() != otp:
+
             return Response(
                 {"error": "کد تایید اشتباه است"}, status=status.HTTP_400_BAD_REQUEST
             )
@@ -66,21 +80,26 @@ class OTPVerificationView(generics.GenericAPIView):
 
 class LoginWithPasswordView(generics.GenericAPIView):
     serializer_class = LoginWithPasswordSerializer
+    throttle_classes = [LoginAttemptThrottle]
 
     def post(self, request):
+
         serializer = self.serializer_class(data=request.data)
         serializer.is_valid(raise_exception=True)
         phone_number = serializer.validated_data["phone_number"]
         password = serializer.validated_data["password"]
         user = CustomUser.objects.filter(phone_number=phone_number).first()
         if not user:
+
             return Response(
-                {"error": "کاربری با این شماره تلفن یافت نشد"},
-                status=status.HTTP_404_NOT_FOUND,
+                {"error": "نام کاربری یا رمز عبور اشتباه است"},
+                status=status.HTTP_400_BAD_REQUEST,
             )
         if not user.check_password(password):
+
             return Response(
-                {"error": "رمز عبور اشتباه است"}, status=status.HTTP_400_BAD_REQUEST
+                {"error": "نام کاربری یا رمز عبور اشتباه است"},
+                status=status.HTTP_400_BAD_REQUEST,
             )
         refresh = RefreshToken.for_user(user)
         data = {
@@ -89,3 +108,23 @@ class LoginWithPasswordView(generics.GenericAPIView):
             "is_verified": user.is_verified,
         }
         return Response(data, status=status.HTTP_200_OK)
+
+
+class ProfileUpdateView(generics.GenericAPIView):
+    serializer_class = ProfileSerializer
+    authentication_classes = [JWTAuthentication]
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+
+        serializer = self.serializer_class(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        user = request.user
+        user.first_name = serializer.validated_data["first_name"]
+        user.last_name = serializer.validated_data["last_name"]
+        user.email = serializer.validated_data["email"]
+        password = serializer.validated_data["password"]
+        user.is_verified = True
+        user.set_password(password)
+        user.save()
+        return Response(serializer.data, status=status.HTTP_200_OK)
